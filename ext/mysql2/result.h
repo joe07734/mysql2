@@ -8,6 +8,7 @@ typedef struct {
   VALUE fields;
   VALUE rows;
   VALUE encoding;
+  VALUE asStruct;
   unsigned int numberOfFields;
   unsigned long numberOfRows;
   unsigned long lastRowProcessed;
