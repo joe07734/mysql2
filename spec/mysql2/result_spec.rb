@@ -73,6 +73,12 @@ describe Mysql2::Result do
       end
     end
 
+    it "should be able to return results as a struct" do
+      @result.each(:as => :struct) do |row|
+        row.kind_of?(Struct).should be_true
+      end
+    end
+
     it "should cache previously yielded results by default" do
       @result.first.object_id.should eql(@result.first.object_id)
     end

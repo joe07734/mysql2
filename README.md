@@ -148,6 +148,10 @@ Pass the `:as => :array` option to any of the above methods of configuration
 
 The default result type is set to :hash, but you can override a previous setting to something else with :as => :hash
 
+### Array of Structs
+
+Use `:as => :struct` to bask in dot-notation results
+
 ### Others...
 
 I may add support for `:as => :csv` or even `:as => :json` to allow for *much* more efficient generation of those data types from result sets.
