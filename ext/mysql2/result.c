@@ -546,7 +546,7 @@ static VALUE rb_mysql_result_each(int argc, VALUE * argv, VALUE self) {
         if (cacheRows && i < rowsProcessed) {
           row = rb_ary_entry(wrapper->rows, i);
         } else {
-          row = rb_mysql_result_fetch_row(self, db_timezone, app_timezone, symbolizeKeys, asArray, castBool, cast, fields);
+          row = rb_mysql_result_fetch_row(self, db_timezone, app_timezone, symbolizeKeys, as, castBool, cast, fields);
           if (cacheRows) {
             rb_ary_store(wrapper->rows, i, row);
           }
