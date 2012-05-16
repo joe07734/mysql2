@@ -368,24 +368,21 @@ static VALUE rb_mysql_result_fetch_row(VALUE self, ID db_timezone, ID app_timezo
     }
   }
 
-  /* TODO: raise exception if > 100 */
   if (as == AS_STRUCT) {
     if (wrapper->asStruct == Qnil) {
       char *buf[100];
-      int num_fields;
 
-      num_fields = wrapper->numberOfFields;
-      if (num_fields > 100)
-        num_fields = 100;
+      if (wrapper->numberOfFields > 100)
+        rb_raise(cMysql2Error, "Too many struct fields: %d", wrapper->numberOfFields);
 
-      for (i = 0; i < num_fields; i++) {
+      for (i = 0; i < wrapper->numberOfFields; i++) {
         MYSQL_FIELD *field = mysql_fetch_field_direct(wrapper->result, i);
         buf[i] = malloc(field->name_length + 1);
         memcpy(buf[i], field->name, field->name_length);
         buf[i][field->name_length] = 0;
       }
-      wrapper->asStruct = rb_mysql_struct_define2(NULL, buf, num_fields);
-      for (i = 0; i < num_fields; i++) {
+      wrapper->asStruct = rb_mysql_struct_define2(NULL, buf, wrapper->numberOfFields);
+      for (i = 0; i < wrapper->numberOfFields; i++) {
         free(buf[i]);
       }
     }
@@ -653,17 +650,13 @@ void init_mysql2_result() {
 }
 
 /*
-# Ruby snippet to create the C function below.
-File.open("bleh.c", "w") do |f|
-    (1..100).each do |i|
-        f.print("  case #{i}:\n")
-        f.print("    st = rb_struct_define(name, ")
-        i.times do |a|
-            f.print("ary[#{a}], ")
-        end
-        f.print("NULL);\n")
-        f.print("    break;\n")
-    end
+# Ruby snippet to create the switch statement below.
+def xxx
+    return (1..100).collect do |i|
+        "  case #{i}:\n    st = rb_struct_define(name, " + 
+        i.times.collect {|a| "ary[#{a}], "}.join +
+        "NULL);\n    break;\n"
+    end.join
 end
 */
 
@@ -701,7 +694,7 @@ static VALUE rb_mysql_struct_define2(const char *name, char **ary, int len) {
     st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], NULL);
     break;
   case 9:
-    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[6], ary[8], NULL);
+    st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], NULL);
     break;
   case 10:
     st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], NULL);
