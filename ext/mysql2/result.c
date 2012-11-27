@@ -375,16 +375,25 @@ static VALUE rb_mysql_result_fetch_row(VALUE self, ID db_timezone, ID app_timezo
       if (wrapper->numberOfFields > 100)
         rb_raise(cMysql2Error, "Too many struct fields: %d", wrapper->numberOfFields);
 
+#if 0
       for (i = 0; i < wrapper->numberOfFields; i++) {
         MYSQL_FIELD *field = mysql_fetch_field_direct(wrapper->result, i);
         buf[i] = malloc(field->name_length + 1);
         memcpy(buf[i], field->name, field->name_length);
         buf[i][field->name_length] = 0;
       }
+#endif
+      for (i = 0; i < wrapper->numberOfFields; i++) {
+        VALUE field = rb_mysql_result_fetch_field(self, i, symbolizeKeys);
+        buf[i] = StringValuePtr(field);
+      }
+
       wrapper->asStruct = rb_mysql_struct_define2(NULL, buf, wrapper->numberOfFields);
+#if 0
       for (i = 0; i < wrapper->numberOfFields; i++) {
         free(buf[i]);
       }
+#endif
     }
 
     rowVal = rb_struct_alloc(wrapper->asStruct, rowVal);
