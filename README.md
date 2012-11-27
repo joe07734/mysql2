@@ -18,7 +18,9 @@ Mysql2::Result - returned from issuing a #query on the connection. It includes E
 gem install mysql2
 ```
 
-You may have to specify --with-mysql-config=/some/random/path/bin/mysql_config
+This gem links against MySQL's `libmysqlclient` C shared library. You may need to install a package such as `libmysqlclient-dev`, `mysql-devel`, or other appropriate package for your system.
+
+If you have installed MySQL to a non-standard location, add `gem install mysql2 --with-mysql-config=/some/random/path/bin/mysql_config`
 
 ## Usage
 
@@ -83,6 +85,28 @@ results.each(:as => :array) do |row|
 # Each row is an array, ordered the same as the query results
 # An otter's den is called a "holt" or "couch"
 end
+```
+
+## Connection options
+
+You may set the following connection options in Mysql2::Client.new(...):
+
+``` ruby
+Mysql2::Client.new(
+  :host,
+  :username,
+  :password,
+  :port,
+  :database,
+  :socket = '/path/to/mysql.sock',
+  :flags = REMEMBER_OPTIONS | LONG_PASSWORD | LONG_FLAG | TRANSACTIONS | PROTOCOL_41 | SECURE_CONNECTION | MULTI_STATEMENTS,
+  :encoding = 'utf8',
+  :read_timeout = seconds,
+  :write_timeout = seconds,
+  :connect_timeout = seconds,
+  :reconnect = true/false,
+  :local_infile = true/false,
+  )
 ```
 
 You can also retrieve multiple result sets. For this to work you need to connect with
@@ -360,6 +384,12 @@ CREATE DATABASE test;
 CREATE USER '<user>'@'localhost' IDENTIFIED BY '';
 GRANT ALL PRIVILEGES ON test.* TO '<user>'@'localhost';
 ```
+
+You can change these defaults in the spec/configuration.yml which is generated
+automatically when you run rake (or explicitly `rake spec/configuration.yml`).
+
+For a normal installation on a Mac, you most likely do not need to do anything,
+though.
 
 ## Special Thanks
 

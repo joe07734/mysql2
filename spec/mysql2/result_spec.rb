@@ -3,7 +3,7 @@ require 'spec_helper'
 
 describe Mysql2::Result do
   before(:each) do
-    @client = Mysql2::Client.new :host => "localhost", :username => "root", :database => 'test'
+    @client = Mysql2::Client.new DatabaseCredentials['root']
   end
 
   before(:each) do
@@ -16,6 +16,27 @@ describe Mysql2::Result do
     result.count.should eql(1)
     result.each { |r| }
     result.count.should eql(1)
+  end
+
+  it "should set the actual count of rows after streaming" do
+      @client.query "USE test"
+      result = @client.query("SELECT * FROM mysql2_test", :stream => true, :cache_rows => false)
+      result.count.should eql(0)
+      result.each {|r|  }
+      result.count.should eql(1)
+  end
+
+  it "should not yield nil at the end of streaming" do
+    result = @client.query('SELECT * FROM mysql2_test', :stream => true)
+    result.each { |r| r.should_not be_nil}
+  end
+
+  it "#count should be zero for rows after streaming when there were no results " do
+      @client.query "USE test"
+      result = @client.query("SELECT * FROM mysql2_test WHERE null_test IS NOT NULL", :stream => true, :cache_rows => false)
+      result.count.should eql(0)
+      result.each {|r|  }
+      result.count.should eql(0)
   end
 
   it "should have included Enumerable" do
@@ -160,13 +181,17 @@ describe Mysql2::Result do
       id1 = @client.last_id
       @client.query 'INSERT INTO mysql2_test (bool_cast_test) VALUES (0)'
       id2 = @client.last_id
+      @client.query 'INSERT INTO mysql2_test (bool_cast_test) VALUES (-1)'
+      id3 = @client.last_id
 
       result1 = @client.query 'SELECT bool_cast_test FROM mysql2_test WHERE bool_cast_test = 1 LIMIT 1', :cast_booleans => true
       result2 = @client.query 'SELECT bool_cast_test FROM mysql2_test WHERE bool_cast_test = 0 LIMIT 1', :cast_booleans => true
+      result3 = @client.query 'SELECT bool_cast_test FROM mysql2_test WHERE bool_cast_test = -1 LIMIT 1', :cast_booleans => true
       result1.first['bool_cast_test'].should be_true
       result2.first['bool_cast_test'].should be_false
+      result3.first['bool_cast_test'].should be_true
 
-      @client.query "DELETE from mysql2_test WHERE id IN(#{id1},#{id2})"
+      @client.query "DELETE from mysql2_test WHERE id IN(#{id1},#{id2},#{id3})"
     end
 
     it "should return Fixnum for a SMALLINT value" do
@@ -215,7 +240,7 @@ describe Mysql2::Result do
     end
 
     if 1.size == 4 # 32bit
-      if RUBY_VERSION =~ /1.9/
+      unless RUBY_VERSION =~ /1.8/
         klass = Time
       else
         klass = DateTime
@@ -233,7 +258,7 @@ describe Mysql2::Result do
         r.first['test'].class.should eql(klass)
       end
     elsif 1.size == 8 # 64bit
-      if RUBY_VERSION =~ /1.9/
+      unless RUBY_VERSION =~ /1.8/
         it "should return Time when timestamp is < 1901-12-13 20:45:52" do
           r = @client.query("SELECT CAST('1901-12-13 20:45:51' AS DATETIME) as test")
           r.first['test'].class.should eql(Time)
@@ -288,7 +313,7 @@ describe Mysql2::Result do
           result = @client.query("SELECT * FROM mysql2_test ORDER BY id DESC LIMIT 1").first
           result['enum_test'].encoding.should eql(Encoding.find('utf-8'))
 
-          client2 = Mysql2::Client.new :encoding => 'ascii'
+          client2 = Mysql2::Client.new(DatabaseCredentials['root'].merge(:encoding => 'ascii'))
           client2.query "USE test"
           result = client2.query("SELECT * FROM mysql2_test ORDER BY id DESC LIMIT 1").first
           result['enum_test'].encoding.should eql(Encoding.find('us-ascii'))
@@ -317,7 +342,7 @@ describe Mysql2::Result do
           result = @client.query("SELECT * FROM mysql2_test ORDER BY id DESC LIMIT 1").first
           result['set_test'].encoding.should eql(Encoding.find('utf-8'))
 
-          client2 = Mysql2::Client.new :encoding => 'ascii'
+          client2 = Mysql2::Client.new(DatabaseCredentials['root'].merge(:encoding => 'ascii'))
           client2.query "USE test"
           result = client2.query("SELECT * FROM mysql2_test ORDER BY id DESC LIMIT 1").first
           result['set_test'].encoding.should eql(Encoding.find('us-ascii'))
@@ -399,7 +424,7 @@ describe Mysql2::Result do
               result = @client.query("SELECT * FROM mysql2_test ORDER BY id DESC LIMIT 1").first
               result[field].encoding.should eql(Encoding.find('utf-8'))
 
-              client2 = Mysql2::Client.new :encoding => 'ascii'
+              client2 = Mysql2::Client.new(DatabaseCredentials['root'].merge(:encoding => 'ascii'))
               client2.query "USE test"
               result = client2.query("SELECT * FROM mysql2_test ORDER BY id DESC LIMIT 1").first
               result[field].encoding.should eql(Encoding.find('us-ascii'))
