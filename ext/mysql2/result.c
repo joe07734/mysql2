@@ -55,7 +55,7 @@ static VALUE opt_decimal_zero, opt_float_zero, opt_time_year, opt_time_month, op
 extern VALUE mMysql2, cMysql2Client, cMysql2Error;
 static ID intern_new, intern_utc, intern_local, intern_localtime, intern_local_offset, intern_civil, intern_new_offset;
 static VALUE sym_symbolize_keys, sym_as, sym_array, sym_struct, sym_database_timezone, sym_application_timezone,
-          sym_local, sym_utc, sym_cast_booleans, sym_cast_dates, sym_cache_rows, sym_cast, sym_stream, sym_name;
+          sym_local, sym_utc, sym_cast_booleans, sym_cast_datetimes, sym_cache_rows, sym_cast, sym_stream, sym_name;
 static ID intern_merge;
 
 /* internal :as constants */
