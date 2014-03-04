@@ -55,7 +55,7 @@ static VALUE opt_decimal_zero, opt_float_zero, opt_time_year, opt_time_month, op
 extern VALUE mMysql2, cMysql2Client, cMysql2Error;
 static ID intern_new, intern_utc, intern_local, intern_localtime, intern_local_offset, intern_civil, intern_new_offset;
 static VALUE sym_symbolize_keys, sym_as, sym_array, sym_struct, sym_database_timezone, sym_application_timezone,
-          sym_local, sym_utc, sym_cast_booleans, sym_cache_rows, sym_cast, sym_stream, sym_name;
+          sym_local, sym_utc, sym_cast_booleans, sym_cast_dates, sym_cache_rows, sym_cast, sym_stream, sym_name;
 static ID intern_merge;
 
 /* internal :as constants */
@@ -176,7 +176,7 @@ static VALUE mysql2_set_field_string_encoding(VALUE val, MYSQL_FIELD field, rb_e
 }
 #endif
 
-static VALUE rb_mysql_result_fetch_row(VALUE self, ID db_timezone, ID app_timezone, int symbolizeKeys, int as, int castBool, int cast, MYSQL_FIELD * fields) {
+static VALUE rb_mysql_result_fetch_row(VALUE self, ID db_timezone, ID app_timezone, int symbolizeKeys, int as, int castBool, int castDateTimes, int cast, MYSQL_FIELD * fields) {
   VALUE rowVal;
   mysql2_result_wrapper * wrapper;
   MYSQL_ROW row;
@@ -338,7 +338,19 @@ static VALUE rb_mysql_result_fetch_row(VALUE self, ID db_timezone, ID app_timezo
               rb_raise(cMysql2Error, "Invalid date: %s", row[i]);
               val = Qnil;
             } else {
-              val = rb_funcall(cDate, intern_new, 3, UINT2NUM(year), UINT2NUM(month), UINT2NUM(day));
+              /* 2014-03-04 joe */
+              if (castDateTimes) {
+                val = rb_funcall(rb_cTime, db_timezone, 7, UINT2NUM(year), UINT2NUM(month), UINT2NUM(day), UINT2NUM(0), UINT2NUM(0), UINT2NUM(0), UINT2NUM(0));
+                if (!NIL_P(app_timezone)) {
+                  if (app_timezone == intern_local) {
+                    val = rb_funcall(val, intern_localtime, 0);
+                  } else { /* utc */
+                    val = rb_funcall(val, intern_utc, 0);
+                  }
+                }
+              } else {
+                val = rb_funcall(cDate, intern_new, 3, UINT2NUM(year), UINT2NUM(month), UINT2NUM(day));
+              }
             }
           }
           break;
@@ -382,25 +394,12 @@ static VALUE rb_mysql_result_fetch_row(VALUE self, ID db_timezone, ID app_timezo
       if (wrapper->numberOfFields > 100)
         rb_raise(cMysql2Error, "Too many struct fields: %d", wrapper->numberOfFields);
 
-#if 0
-      for (i = 0; i < wrapper->numberOfFields; i++) {
-        MYSQL_FIELD *field = mysql_fetch_field_direct(wrapper->result, i);
-        buf[i] = malloc(field->name_length + 1);
-        memcpy(buf[i], field->name, field->name_length);
-        buf[i][field->name_length] = 0;
-      }
-#endif
       for (i = 0; i < wrapper->numberOfFields; i++) {
         VALUE field = rb_mysql_result_fetch_field(self, i, symbolizeKeys);
         buf[i] = StringValuePtr(field);
       }
 
       wrapper->asStruct = rb_mysql_struct_define2(NULL, buf, wrapper->numberOfFields);
-#if 0
-      for (i = 0; i < wrapper->numberOfFields; i++) {
-        free(buf[i]);
-      }
-#endif
     }
 
     rowVal = rb_struct_alloc(wrapper->asStruct, rowVal);
@@ -441,7 +440,7 @@ static VALUE rb_mysql_result_each(int argc, VALUE * argv, VALUE self) {
   ID db_timezone, app_timezone, dbTz, appTz;
   mysql2_result_wrapper * wrapper;
   unsigned long i;
-  int symbolizeKeys = 0, as = AS_HASH, castBool = 0, cacheRows = 1, cast = 1, streaming = 0;
+  int symbolizeKeys = 0, as = AS_HASH, castBool = 0, castDateTimes = 0, cacheRows = 1, cast = 1, streaming = 0;
   MYSQL_FIELD * fields = NULL;
 
   GetMysql2Result(self, wrapper);
@@ -465,6 +464,10 @@ static VALUE rb_mysql_result_each(int argc, VALUE * argv, VALUE self) {
 
   if (rb_hash_aref(opts, sym_cast_booleans) == Qtrue) {
     castBool = 1;
+  }
+
+  if (rb_hash_aref(opts, sym_cast_datetimes) == Qtrue) {
+    castDateTimes = 1;
   }
 
   if (rb_hash_aref(opts, sym_cache_rows) == Qfalse) {
@@ -527,7 +530,7 @@ static VALUE rb_mysql_result_each(int argc, VALUE * argv, VALUE self) {
       fields = mysql_fetch_fields(wrapper->result);
 
       do {
-        row = rb_mysql_result_fetch_row(self, db_timezone, app_timezone, symbolizeKeys, as, castBool, cast, fields);
+        row = rb_mysql_result_fetch_row(self, db_timezone, app_timezone, symbolizeKeys, as, castBool, castDateTimes, cast, fields);
 
         if (block != Qnil && row != Qnil) {
           rb_yield(row);
@@ -559,7 +562,7 @@ static VALUE rb_mysql_result_each(int argc, VALUE * argv, VALUE self) {
         if (cacheRows && i < rowsProcessed) {
           row = rb_ary_entry(wrapper->rows, i);
         } else {
-          row = rb_mysql_result_fetch_row(self, db_timezone, app_timezone, symbolizeKeys, as, castBool, cast, fields);
+          row = rb_mysql_result_fetch_row(self, db_timezone, app_timezone, symbolizeKeys, as, castBool, castDateTimes, cast, fields);
           if (cacheRows) {
             rb_ary_store(wrapper->rows, i, row);
           }
@@ -647,12 +650,13 @@ void init_mysql2_result() {
   sym_local           = ID2SYM(rb_intern("local"));
   sym_utc             = ID2SYM(rb_intern("utc"));
   sym_cast_booleans   = ID2SYM(rb_intern("cast_booleans"));
+  sym_cast_datetimes  = ID2SYM(rb_intern("cast_datetimes"));
   sym_database_timezone     = ID2SYM(rb_intern("database_timezone"));
   sym_application_timezone  = ID2SYM(rb_intern("application_timezone"));
-  sym_cache_rows     = ID2SYM(rb_intern("cache_rows"));
-  sym_cast           = ID2SYM(rb_intern("cast"));
-  sym_stream         = ID2SYM(rb_intern("stream"));
-  sym_name           = ID2SYM(rb_intern("name"));
+  sym_cache_rows      = ID2SYM(rb_intern("cache_rows"));
+  sym_cast            = ID2SYM(rb_intern("cast"));
+  sym_stream          = ID2SYM(rb_intern("stream"));
+  sym_name            = ID2SYM(rb_intern("name"));
 
   opt_decimal_zero = rb_str_new2("0.0");
   rb_global_variable(&opt_decimal_zero); /*never GC */
