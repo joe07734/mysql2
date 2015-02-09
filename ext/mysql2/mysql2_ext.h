@@ -6,7 +6,6 @@
    we'll never modify the pointers we get back from RSTRING_PTR */
 #define RSTRING_NOT_MODIFIED
 #include <ruby.h>
-#include <fcntl.h>
 
 #ifndef HAVE_UINT
 #define HAVE_UINT
@@ -29,6 +28,9 @@ typedef unsigned int    uint;
 #ifdef HAVE_RUBY_ENCODING_H
 #include <ruby/encoding.h>
 #endif
+#ifdef HAVE_RUBY_THREAD_H
+#include <ruby/thread.h>
+#endif
 
 #if defined(__GNUC__) && (__GNUC__ >= 3)
 #define RB_MYSQL_UNUSED __attribute__ ((unused))
@@ -38,5 +40,6 @@ typedef unsigned int    uint;
 
 #include <client.h>
 #include <result.h>
+#include <infile.h>
 
 #endif

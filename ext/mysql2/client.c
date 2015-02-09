@@ -1,10 +1,15 @@
 #include <mysql2_ext.h>
-#include <client.h>
+
+#include <time.h>
 #include <errno.h>
 #ifndef _WIN32
+#include <sys/types.h>
 #include <sys/socket.h>
 #endif
+#ifndef _MSC_VER
 #include <unistd.h>
+#endif
+#include <fcntl.h>
 #include "wait_for_single_fd.h"
 
 #include "mysql_enc_name_to_ruby.h"
@@ -12,7 +17,7 @@
 VALUE cMysql2Client;
 extern VALUE mMysql2, cMysql2Error;
 static VALUE sym_id, sym_version, sym_async, sym_symbolize_keys, sym_as, sym_array, sym_stream;
-static ID intern_merge, intern_error_number_eql, intern_sql_state_eql;
+static ID intern_merge, intern_merge_bang, intern_error_number_eql, intern_sql_state_eql;
 
 #ifndef HAVE_RB_HASH_DUP
 static VALUE rb_hash_dup(VALUE other) {
@@ -45,8 +50,19 @@ static VALUE rb_hash_dup(VALUE other) {
   Data_Get_Struct(self, mysql_client_wrapper, wrapper)
 
 /*
+ * compatability with mysql-connector-c, where LIBMYSQL_VERSION is the correct
+ * variable to use, but MYSQL_SERVER_VERSION gives the correct numbers when
+ * linking against the server itself
+ */
+#ifdef LIBMYSQL_VERSION
+  #define MYSQL_LINK_VERSION LIBMYSQL_VERSION
+#else
+  #define MYSQL_LINK_VERSION MYSQL_SERVER_VERSION
+#endif
+
+/*
  * used to pass all arguments to mysql_real_connect while inside
- * rb_thread_blocking_region
+ * rb_thread_call_without_gvl
  */
 struct nogvl_connect_args {
   MYSQL *mysql;
@@ -61,7 +77,7 @@ struct nogvl_connect_args {
 
 /*
  * used to pass all arguments to mysql_send_query while inside
- * rb_thread_blocking_region
+ * rb_thread_call_without_gvl
  */
 struct nogvl_send_query_args {
   MYSQL *mysql;
@@ -73,7 +89,7 @@ struct nogvl_send_query_args {
 
 /*
  * used to pass all arguments to mysql_select_db while inside
- * rb_thread_blocking_region
+ * rb_thread_call_without_gvl
  */
 struct nogvl_select_db_args {
   MYSQL *mysql;
@@ -113,34 +129,33 @@ static void rb_mysql_client_mark(void * wrapper) {
 static VALUE rb_raise_mysql2_error(mysql_client_wrapper *wrapper) {
   VALUE rb_error_msg = rb_str_new2(mysql_error(wrapper->client));
   VALUE rb_sql_state = rb_tainted_str_new2(mysql_sqlstate(wrapper->client));
-#ifdef HAVE_RUBY_ENCODING_H
-  rb_encoding *default_internal_enc = rb_default_internal_encoding();
-  rb_encoding *conn_enc = rb_to_encoding(wrapper->encoding);
+  VALUE e;
 
-  rb_enc_associate(rb_error_msg, conn_enc);
-  rb_enc_associate(rb_sql_state, conn_enc);
-  if (default_internal_enc) {
-    rb_error_msg = rb_str_export_to_enc(rb_error_msg, default_internal_enc);
-    rb_sql_state = rb_str_export_to_enc(rb_sql_state, default_internal_enc);
-  }
+#ifdef HAVE_RUBY_ENCODING_H
+  rb_enc_associate(rb_error_msg, rb_utf8_encoding());
+  rb_enc_associate(rb_sql_state, rb_usascii_encoding());
 #endif
 
-  VALUE e = rb_exc_new3(cMysql2Error, rb_error_msg);
+  e = rb_funcall(cMysql2Error, rb_intern("new"), 2, rb_error_msg, LONG2FIX(wrapper->server_version));
   rb_funcall(e, intern_error_number_eql, 1, UINT2NUM(mysql_errno(wrapper->client)));
   rb_funcall(e, intern_sql_state_eql, 1, rb_sql_state);
   rb_exc_raise(e);
   return Qnil;
 }
 
-static VALUE nogvl_init(void *ptr) {
+static void *nogvl_init(void *ptr) {
   MYSQL *client;
+  mysql_client_wrapper *wrapper = (mysql_client_wrapper *)ptr;
 
   /* may initialize embedded server and read /etc/services off disk */
-  client = mysql_init((MYSQL *)ptr);
-  return client ? Qtrue : Qfalse;
+  client = mysql_init(wrapper->client);
+
+  if (client) mysql2_set_local_infile(client, wrapper);
+
+  return (void*)(client ? Qtrue : Qfalse);
 }
 
-static VALUE nogvl_connect(void *ptr) {
+static void *nogvl_connect(void *ptr) {
   struct nogvl_connect_args *args = ptr;
   MYSQL *client;
 
@@ -149,46 +164,94 @@ static VALUE nogvl_connect(void *ptr) {
                               args->db, args->port, args->unix_socket,
                               args->client_flag);
 
-  return client ? Qtrue : Qfalse;
+  return (void *)(client ? Qtrue : Qfalse);
 }
 
-static VALUE nogvl_close(void *ptr) {
-  mysql_client_wrapper *wrapper;
 #ifndef _WIN32
-  int flags;
+/*
+ * Redirect clientfd to /dev/null for mysql_close and SSL_close to write,
+ * shutdown, and close. The hack is needed to prevent shutdown() from breaking
+ * a socket that may be in use by the parent or other processes after fork.
+ *
+ * /dev/null is used to absorb writes; previously a dummy socket was used, but
+ * it could not abosrb writes and caused openssl to go into an infinite loop.
+ *
+ * Returns Qtrue or Qfalse (success or failure)
+ *
+ * Note: if this function is needed on Windows, use "nul" instead of "/dev/null"
+ */
+static VALUE invalidate_fd(int clientfd)
+{
+#ifdef SOCK_CLOEXEC
+  /* Atomically set CLOEXEC on the new FD in case another thread forks */
+  int sockfd = open("/dev/null", O_RDWR | O_CLOEXEC);
+  if (sockfd < 0) {
+    /* Maybe SOCK_CLOEXEC is defined but not available on this kernel */
+    int sockfd = open("/dev/null", O_RDWR);
+    fcntl(sockfd, F_SETFD, FD_CLOEXEC);
+  }
+#else
+  /* Well we don't have SOCK_CLOEXEC, so just set FD_CLOEXEC quickly */
+  int sockfd = open("/dev/null", O_RDWR);
+  fcntl(sockfd, F_SETFD, FD_CLOEXEC);
 #endif
+
+  if (sockfd < 0) {
+    /*
+     * Cannot raise here, because one or both of the following may be true:
+     * a) we have no GVL (in C Ruby)
+     * b) are running as a GC finalizer
+     */
+    return Qfalse;
+  }
+
+  dup2(sockfd, clientfd);
+  close(sockfd);
+
+  return Qtrue;
+}
+#endif /* _WIN32 */
+
+static void *nogvl_close(void *ptr) {
+  mysql_client_wrapper *wrapper;
   wrapper = ptr;
   if (wrapper->connected) {
     wrapper->active_thread = Qnil;
     wrapper->connected = 0;
-    /*
-     * we'll send a QUIT message to the server, but that message is more of a
-     * formality than a hard requirement since the socket is getting shutdown
-     * anyways, so ensure the socket write does not block our interpreter
-     *
-     *
-     * if the socket is dead we have no chance of blocking,
-     * so ignore any potential fcntl errors since they don't matter
-     */
 #ifndef _WIN32
-    flags = fcntl(wrapper->client->net.fd, F_GETFL);
-    if (flags > 0 && !(flags & O_NONBLOCK))
-      fcntl(wrapper->client->net.fd, F_SETFL, flags | O_NONBLOCK);
+    /* Invalidate the socket before calling mysql_close(). This prevents
+     * mysql_close() from sending a mysql-QUIT or from calling shutdown() on
+     * the socket. The difference is that invalidate_fd will drop this
+     * process's reference to the socket only, while a QUIT or shutdown()
+     * would render the underlying connection unusable, interrupting other
+     * processes which share this object across a fork().
+     */
+    if (invalidate_fd(wrapper->client->net.fd) == Qfalse) {
+      fprintf(stderr, "[WARN] mysql2 failed to invalidate FD safely, leaking some memory\n");
+      close(wrapper->client->net.fd);
+      return NULL;
+    }
 #endif
 
-    mysql_close(wrapper->client);
-    xfree(wrapper->client);
+    mysql_close(wrapper->client); /* only used to free memory at this point */
   }
 
-  return Qnil;
+  return NULL;
 }
 
-static void rb_mysql_client_free(void * ptr) {
+static void rb_mysql_client_free(void *ptr) {
   mysql_client_wrapper *wrapper = (mysql_client_wrapper *)ptr;
+  decr_mysql2_client(wrapper);
+}
 
-  nogvl_close(wrapper);
-
-  xfree(ptr);
+void decr_mysql2_client(mysql_client_wrapper *wrapper)
+{
+  wrapper->refcount--;
+  if (wrapper->refcount == 0) {
+    nogvl_close(wrapper);
+    xfree(wrapper->client);
+    xfree(wrapper);
+  }
 }
 
 static VALUE allocate(VALUE klass) {
@@ -197,9 +260,12 @@ static VALUE allocate(VALUE klass) {
   obj = Data_Make_Struct(klass, mysql_client_wrapper, rb_mysql_client_mark, rb_mysql_client_free, wrapper);
   wrapper->encoding = Qnil;
   wrapper->active_thread = Qnil;
+  wrapper->server_version = 0;
   wrapper->reconnect_enabled = 0;
+  wrapper->connect_timeout = 0;
   wrapper->connected = 0; /* means that a database connection is open */
   wrapper->initialized = 0; /* means that that the wrapper is initialized */
+  wrapper->refcount = 1;
   wrapper->client = (MYSQL*)xmalloc(sizeof(MYSQL));
   return obj;
 }
@@ -236,30 +302,80 @@ static VALUE rb_mysql_client_escape(RB_MYSQL_UNUSED VALUE klass, VALUE str) {
   }
 }
 
+static VALUE rb_mysql_client_warning_count(VALUE self) {
+  unsigned int warning_count;
+  GET_CLIENT(self);
+
+  warning_count = mysql_warning_count(wrapper->client);
+
+  return UINT2NUM(warning_count);
+}
+
+static VALUE rb_mysql_info(VALUE self) {
+  const char *info;
+  VALUE rb_str;
+  GET_CLIENT(self);
+
+  info = mysql_info(wrapper->client);
+
+  if (info == NULL) {
+    return Qnil;
+  }
+
+  rb_str = rb_str_new2(info);
+#ifdef HAVE_RUBY_ENCODING_H
+  rb_enc_associate(rb_str, rb_utf8_encoding());
+#endif
+
+  return rb_str;
+}
+
 static VALUE rb_connect(VALUE self, VALUE user, VALUE pass, VALUE host, VALUE port, VALUE database, VALUE socket, VALUE flags) {
   struct nogvl_connect_args args;
+  time_t start_time, end_time;
+  unsigned int elapsed_time, connect_timeout;
   VALUE rv;
   GET_CLIENT(self);
 
-  args.host = NIL_P(host) ? "localhost" : StringValuePtr(host);
+  args.host = NIL_P(host) ? NULL : StringValuePtr(host);
   args.unix_socket = NIL_P(socket) ? NULL : StringValuePtr(socket);
-  args.port = NIL_P(port) ? 3306 : NUM2INT(port);
+  args.port = NIL_P(port) ? 0 : NUM2INT(port);
   args.user = NIL_P(user) ? NULL : StringValuePtr(user);
   args.passwd = NIL_P(pass) ? NULL : StringValuePtr(pass);
   args.db = NIL_P(database) ? NULL : StringValuePtr(database);
   args.mysql = wrapper->client;
   args.client_flag = NUM2ULONG(flags);
 
-  rv = rb_thread_blocking_region(nogvl_connect, &args, RUBY_UBF_IO, 0);
+  if (wrapper->connect_timeout)
+    time(&start_time);
+  rv = (VALUE) rb_thread_call_without_gvl(nogvl_connect, &args, RUBY_UBF_IO, 0);
   if (rv == Qfalse) {
-    while (rv == Qfalse && errno == EINTR && !mysql_errno(wrapper->client)) {
+    while (rv == Qfalse && errno == EINTR) {
+      if (wrapper->connect_timeout) {
+        time(&end_time);
+        /* avoid long connect timeout from system time changes */
+        if (end_time < start_time)
+          start_time = end_time;
+        elapsed_time = end_time - start_time;
+        /* avoid an early timeout due to time truncating milliseconds off the start time */
+        if (elapsed_time > 0)
+          elapsed_time--;
+        if (elapsed_time >= wrapper->connect_timeout)
+          break;
+        connect_timeout = wrapper->connect_timeout - elapsed_time;
+        mysql_options(wrapper->client, MYSQL_OPT_CONNECT_TIMEOUT, &connect_timeout);
+      }
       errno = 0;
-      rv = rb_thread_blocking_region(nogvl_connect, &args, RUBY_UBF_IO, 0);
+      rv = (VALUE) rb_thread_call_without_gvl(nogvl_connect, &args, RUBY_UBF_IO, 0);
     }
+    /* restore the connect timeout for reconnecting */
+    if (wrapper->connect_timeout)
+      mysql_options(wrapper->client, MYSQL_OPT_CONNECT_TIMEOUT, &wrapper->connect_timeout);
     if (rv == Qfalse)
       return rb_raise_mysql2_error(wrapper);
   }
 
+  wrapper->server_version = mysql_get_server_version(wrapper->client);
   wrapper->connected = 1;
   return self;
 }
@@ -274,7 +390,7 @@ static VALUE rb_mysql_client_close(VALUE self) {
   GET_CLIENT(self);
 
   if (wrapper->connected) {
-    rb_thread_blocking_region(nogvl_close, wrapper, RUBY_UBF_IO, 0);
+    rb_thread_call_without_gvl(nogvl_close, wrapper, RUBY_UBF_IO, 0);
   }
 
   return Qnil;
@@ -285,19 +401,19 @@ static VALUE rb_mysql_client_close(VALUE self) {
  * enough to fit in a socket buffer, but sometimes large UPDATE and
  * INSERTs will cause the process to block
  */
-static VALUE nogvl_send_query(void *ptr) {
+static void *nogvl_send_query(void *ptr) {
   struct nogvl_send_query_args *args = ptr;
   int rv;
 
   rv = mysql_send_query(args->mysql, args->sql_ptr, args->sql_len);
 
-  return rv == 0 ? Qtrue : Qfalse;
+  return (void*)(rv == 0 ? Qtrue : Qfalse);
 }
 
 static VALUE do_send_query(void *args) {
   struct nogvl_send_query_args *query_args = args;
   mysql_client_wrapper *wrapper = query_args->wrapper;
-  if (rb_thread_blocking_region(nogvl_send_query, args, RUBY_UBF_IO, 0) == Qfalse) {
+  if ((VALUE)rb_thread_call_without_gvl(nogvl_send_query, args, RUBY_UBF_IO, 0) == Qfalse) {
     /* an error occurred, we're not active anymore */
     MARK_CONN_INACTIVE(self);
     return rb_raise_mysql2_error(wrapper);
@@ -310,14 +426,14 @@ static VALUE do_send_query(void *args) {
  * response can overflow the socket buffers and cause us to eventually
  * block while calling mysql_read_query_result
  */
-static VALUE nogvl_read_query_result(void *ptr) {
+static void *nogvl_read_query_result(void *ptr) {
   MYSQL * client = ptr;
   my_bool res = mysql_read_query_result(client);
 
-  return res == 0 ? Qtrue : Qfalse;
+  return (void *)(res == 0 ? Qtrue : Qfalse);
 }
 
-static VALUE nogvl_do_result(void *ptr, char use_result) {
+static void *nogvl_do_result(void *ptr, char use_result) {
   mysql_client_wrapper *wrapper;
   MYSQL_RES *result;
 
@@ -332,15 +448,15 @@ static VALUE nogvl_do_result(void *ptr, char use_result) {
      ready for another command to be issued */
   wrapper->active_thread = Qnil;
 
-  return (VALUE)result;
+  return result;
 }
 
 /* mysql_store_result may (unlikely) read rows off the socket */
-static VALUE nogvl_store_result(void *ptr) {
+static void *nogvl_store_result(void *ptr) {
   return nogvl_do_result(ptr, 0);
 }
 
-static VALUE nogvl_use_result(void *ptr) {
+static void *nogvl_use_result(void *ptr) {
   return nogvl_do_result(ptr, 1);
 }
 
@@ -352,9 +468,7 @@ static VALUE nogvl_use_result(void *ptr) {
 static VALUE rb_mysql_client_async_result(VALUE self) {
   MYSQL_RES * result;
   VALUE resultObj;
-#ifdef HAVE_RUBY_ENCODING_H
-  mysql2_result_wrapper * result_wrapper;
-#endif
+  VALUE current, is_streaming;
   GET_CLIENT(self);
 
   /* if we're not waiting on a result, do nothing */
@@ -362,17 +476,17 @@ static VALUE rb_mysql_client_async_result(VALUE self) {
     return Qnil;
 
   REQUIRE_CONNECTED(wrapper);
-  if (rb_thread_blocking_region(nogvl_read_query_result, wrapper->client, RUBY_UBF_IO, 0) == Qfalse) {
+  if ((VALUE)rb_thread_call_without_gvl(nogvl_read_query_result, wrapper->client, RUBY_UBF_IO, 0) == Qfalse) {
     /* an error occurred, mark this connection inactive */
     MARK_CONN_INACTIVE(self);
     return rb_raise_mysql2_error(wrapper);
   }
 
-  VALUE is_streaming = rb_hash_aref(rb_iv_get(self, "@query_options"), sym_stream);
+  is_streaming = rb_hash_aref(rb_iv_get(self, "@current_query_options"), sym_stream);
   if(is_streaming == Qtrue) {
-    result = (MYSQL_RES *)rb_thread_blocking_region(nogvl_use_result, wrapper, RUBY_UBF_IO, 0);
+    result = (MYSQL_RES *)rb_thread_call_without_gvl(nogvl_use_result, wrapper, RUBY_UBF_IO, 0);
   } else {
-    result = (MYSQL_RES *)rb_thread_blocking_region(nogvl_store_result, wrapper, RUBY_UBF_IO, 0);
+    result = (MYSQL_RES *)rb_thread_call_without_gvl(nogvl_store_result, wrapper, RUBY_UBF_IO, 0);
   }
 
   if (result == NULL) {
@@ -384,14 +498,11 @@ static VALUE rb_mysql_client_async_result(VALUE self) {
     return Qnil;
   }
 
-  resultObj = rb_mysql_result_to_obj(result);
-  /* pass-through query options for result construction later */
-  rb_iv_set(resultObj, "@query_options", rb_hash_dup(rb_iv_get(self, "@query_options")));
+  current = rb_hash_dup(rb_iv_get(self, "@current_query_options"));
+  RB_GC_GUARD(current);
+  Check_Type(current, T_HASH);
+  resultObj = rb_mysql_result_to_obj(self, wrapper->encoding, current, result);
 
-#ifdef HAVE_RUBY_ENCODING_H
-  GetMysql2Result(resultObj, result_wrapper);
-  result_wrapper->encoding = wrapper->encoding;
-#endif
   return resultObj;
 }
 
@@ -407,10 +518,13 @@ static VALUE disconnect_and_raise(VALUE self, VALUE error) {
   wrapper->active_thread = Qnil;
   wrapper->connected = 0;
 
-  /* manually close the socket for read/write
-     this feels dirty, but is there another way? */
-  close(wrapper->client->net.fd);
-  wrapper->client->net.fd = -1;
+  /* Invalidate the MySQL socket to prevent further communication.
+   * The GC will come along later and call mysql_close to free it.
+   */
+  if (invalidate_fd(wrapper->client->net.fd) == Qfalse) {
+    fprintf(stderr, "[WARN] mysql2 failed to invalidate FD safely, closing unsafely\n");
+    close(wrapper->client->net.fd);
+  }
 
   rb_exc_raise(error);
 
@@ -474,7 +588,7 @@ static VALUE finish_and_mark_inactive(void *args) {
     /* if we got here, the result hasn't been read off the wire yet
        so lets do that and then throw it away because we have no way
        of getting it back up to the caller from here */
-    result = (MYSQL_RES *)rb_thread_blocking_region(nogvl_store_result, wrapper, RUBY_UBF_IO, 0);
+    result = (MYSQL_RES *)rb_thread_call_without_gvl(nogvl_store_result, wrapper, RUBY_UBF_IO, 0);
     mysql_free_result(result);
 
     wrapper->active_thread = Qnil;
@@ -493,10 +607,10 @@ static VALUE finish_and_mark_inactive(void *args) {
  * again.
  */
 static VALUE rb_mysql_client_abandon_results(VALUE self) {
-  GET_CLIENT(self);
-
   MYSQL_RES *result;
   int ret;
+
+  GET_CLIENT(self);
 
   while (mysql_more_results(wrapper->client) == 1) {
     ret = mysql_next_result(wrapper->client);
@@ -504,7 +618,7 @@ static VALUE rb_mysql_client_abandon_results(VALUE self) {
       rb_raise_mysql2_error(wrapper);
     }
 
-    result = (MYSQL_RES *)rb_thread_blocking_region(nogvl_store_result, wrapper, RUBY_UBF_IO, 0);
+    result = (MYSQL_RES *)rb_thread_call_without_gvl(nogvl_store_result, wrapper, RUBY_UBF_IO, 0);
 
     if (result != NULL) {
       mysql_free_result(result);
@@ -526,7 +640,7 @@ static VALUE rb_mysql_client_query(int argc, VALUE * argv, VALUE self) {
 #endif
   struct nogvl_send_query_args args;
   int async = 0;
-  VALUE opts, defaults;
+  VALUE opts, current;
   VALUE thread_current = rb_thread_current();
 #ifdef HAVE_RUBY_ENCODING_H
   rb_encoding *conn_enc;
@@ -536,16 +650,17 @@ static VALUE rb_mysql_client_query(int argc, VALUE * argv, VALUE self) {
   REQUIRE_CONNECTED(wrapper);
   args.mysql = wrapper->client;
 
-  defaults = rb_iv_get(self, "@query_options");
-  if (rb_scan_args(argc, argv, "11", &args.sql, &opts) == 2) {
-    opts = rb_funcall(defaults, intern_merge, 1, opts);
-    rb_iv_set(self, "@query_options", opts);
+  current = rb_hash_dup(rb_iv_get(self, "@query_options"));
+  RB_GC_GUARD(current);
+  Check_Type(current, T_HASH);
+  rb_iv_set(self, "@current_query_options", current);
 
-    if (rb_hash_aref(opts, sym_async) == Qtrue) {
+  if (rb_scan_args(argc, argv, "11", &args.sql, &opts) == 2) {
+    rb_funcall(current, intern_merge_bang, 1, opts);
+
+    if (rb_hash_aref(current, sym_async) == Qtrue) {
       async = 1;
     }
-  } else {
-    opts = defaults;
   }
 
   Check_Type(args.sql, T_STRING);
@@ -641,8 +756,9 @@ static VALUE rb_mysql_client_real_escape(VALUE self, VALUE str) {
 
 static VALUE _mysql_client_options(VALUE self, int opt, VALUE value) {
   int result;
-  void *retval = NULL;
+  const void *retval = NULL;
   unsigned int intval = 0;
+  const char * charval = NULL;
   my_bool boolval;
 
   GET_CLIENT(self);
@@ -654,17 +770,17 @@ static VALUE _mysql_client_options(VALUE self, int opt, VALUE value) {
 
   switch(opt) {
     case MYSQL_OPT_CONNECT_TIMEOUT:
-      intval = NUM2INT(value);
+      intval = NUM2UINT(value);
       retval = &intval;
       break;
 
     case MYSQL_OPT_READ_TIMEOUT:
-      intval = NUM2INT(value);
+      intval = NUM2UINT(value);
       retval = &intval;
       break;
 
     case MYSQL_OPT_WRITE_TIMEOUT:
-      intval = NUM2INT(value);
+      intval = NUM2UINT(value);
       retval = &intval;
       break;
 
@@ -678,6 +794,26 @@ static VALUE _mysql_client_options(VALUE self, int opt, VALUE value) {
       retval = &boolval;
       break;
 
+    case MYSQL_SECURE_AUTH:
+      boolval = (value == Qfalse ? 0 : 1);
+      retval = &boolval;
+      break;
+
+    case MYSQL_READ_DEFAULT_FILE:
+      charval = (const char *)StringValuePtr(value);
+      retval  = charval;
+      break;
+
+    case MYSQL_READ_DEFAULT_GROUP:
+      charval = (const char *)StringValuePtr(value);
+      retval  = charval;
+      break;
+
+    case MYSQL_INIT_COMMAND:
+      charval = (const char *)StringValuePtr(value);
+      retval  = charval;
+      break;
+
     default:
       return Qfalse;
   }
@@ -688,9 +824,15 @@ static VALUE _mysql_client_options(VALUE self, int opt, VALUE value) {
   if (result != 0) {
     rb_warn("%s\n", mysql_error(wrapper->client));
   } else {
-    /* Special case for reconnect, this option is also stored in the wrapper struct */
-    if (opt == MYSQL_OPT_RECONNECT)
-      wrapper->reconnect_enabled = boolval;
+    /* Special case for options that are stored in the wrapper struct */
+    switch (opt) {
+      case MYSQL_OPT_RECONNECT:
+        wrapper->reconnect_enabled = boolval;
+        break;
+      case MYSQL_OPT_CONNECT_TIMEOUT:
+        wrapper->connect_timeout = intval;
+        break;
+    }
   }
 
   return (result == 0) ? Qtrue : Qfalse;
@@ -706,8 +848,8 @@ static VALUE rb_mysql_client_info(VALUE self) {
 #ifdef HAVE_RUBY_ENCODING_H
   rb_encoding *default_internal_enc;
   rb_encoding *conn_enc;
-#endif
   GET_CLIENT(self);
+#endif
   version = rb_hash_new();
 
 #ifdef HAVE_RUBY_ENCODING_H
@@ -767,9 +909,12 @@ static VALUE rb_mysql_client_server_info(VALUE self) {
 static VALUE rb_mysql_client_socket(VALUE self) {
   GET_CLIENT(self);
 #ifndef _WIN32
-  REQUIRE_CONNECTED(wrapper);
-  int fd_set_fd = wrapper->client->net.fd;
-  return INT2NUM(fd_set_fd);
+  {
+    int fd_set_fd;
+    REQUIRE_CONNECTED(wrapper);
+    fd_set_fd = wrapper->client->net.fd;
+    return INT2NUM(fd_set_fd);
+  }
 #else
   rb_raise(cMysql2Error, "Raw access to the mysql file descriptor isn't supported on Windows");
 #endif
@@ -819,13 +964,13 @@ static VALUE rb_mysql_client_thread_id(VALUE self) {
   return ULL2NUM(retVal);
 }
 
-static VALUE nogvl_select_db(void *ptr) {
+static void *nogvl_select_db(void *ptr) {
   struct nogvl_select_db_args *args = ptr;
 
   if (mysql_select_db(args->mysql, args->db) == 0)
-    return Qtrue;
+    return (void *)Qtrue;
   else
-    return Qfalse;
+    return (void *)Qfalse;
 }
 
 /* call-seq:
@@ -844,16 +989,16 @@ static VALUE rb_mysql_client_select_db(VALUE self, VALUE db)
   args.mysql = wrapper->client;
   args.db = StringValuePtr(db);
 
-  if (rb_thread_blocking_region(nogvl_select_db, &args, RUBY_UBF_IO, 0) == Qfalse)
+  if (rb_thread_call_without_gvl(nogvl_select_db, &args, RUBY_UBF_IO, 0) == Qfalse)
     rb_raise_mysql2_error(wrapper);
 
   return db;
 }
 
-static VALUE nogvl_ping(void *ptr) {
+static void *nogvl_ping(void *ptr) {
   MYSQL *client = ptr;
 
-  return mysql_ping(client) == 0 ? Qtrue : Qfalse;
+  return (void *)(mysql_ping(client) == 0 ? Qtrue : Qfalse);
 }
 
 /* call-seq:
@@ -870,7 +1015,7 @@ static VALUE rb_mysql_client_ping(VALUE self) {
   if (!wrapper->connected) {
     return Qfalse;
   } else {
-    return rb_thread_blocking_region(nogvl_ping, wrapper->client, RUBY_UBF_IO, 0);
+    return (VALUE)rb_thread_call_without_gvl(nogvl_ping, wrapper->client, RUBY_UBF_IO, 0);
   }
 }
 
@@ -896,8 +1041,8 @@ static VALUE rb_mysql_client_more_results(VALUE self)
  */
 static VALUE rb_mysql_client_next_result(VALUE self)
 {
-    GET_CLIENT(self);
     int ret;
+    GET_CLIENT(self);
     ret = mysql_next_result(wrapper->client);
     if (ret > 0) {
       rb_raise_mysql2_error(wrapper);
@@ -919,13 +1064,10 @@ static VALUE rb_mysql_client_store_result(VALUE self)
 {
   MYSQL_RES * result;
   VALUE resultObj;
-#ifdef HAVE_RUBY_ENCODING_H
-  mysql2_result_wrapper * result_wrapper;
-#endif
-
+  VALUE current;
   GET_CLIENT(self);
 
-  result = (MYSQL_RES *)rb_thread_blocking_region(nogvl_store_result, wrapper, RUBY_UBF_IO, 0);
+  result = (MYSQL_RES *)rb_thread_call_without_gvl(nogvl_store_result, wrapper, RUBY_UBF_IO, 0);
 
   if (result == NULL) {
     if (mysql_errno(wrapper->client) != 0) {
@@ -935,16 +1077,12 @@ static VALUE rb_mysql_client_store_result(VALUE self)
     return Qnil;
   }
 
-  resultObj = rb_mysql_result_to_obj(result);
-  /* pass-through query options for result construction later */
-  rb_iv_set(resultObj, "@query_options", rb_hash_dup(rb_iv_get(self, "@query_options")));
+  current = rb_hash_dup(rb_iv_get(self, "@current_query_options"));
+  RB_GC_GUARD(current);
+  Check_Type(current, T_HASH);
+  resultObj = rb_mysql_result_to_obj(self, wrapper->encoding, current, result);
 
-#ifdef HAVE_RUBY_ENCODING_H
-  GetMysql2Result(resultObj, result_wrapper);
-  result_wrapper->encoding = wrapper->encoding;
-#endif
   return resultObj;
-
 }
 
 #ifdef HAVE_RUBY_ENCODING_H
@@ -1010,18 +1148,18 @@ static VALUE set_write_timeout(VALUE self, VALUE value) {
 
 static VALUE set_charset_name(VALUE self, VALUE value) {
   char *charset_name;
+#ifdef HAVE_RUBY_ENCODING_H
   size_t charset_name_len;
   const struct mysql2_mysql_enc_name_to_rb_map *mysql2rb;
-#ifdef HAVE_RUBY_ENCODING_H
   rb_encoding *enc;
   VALUE rb_enc;
 #endif
   GET_CLIENT(self);
 
   charset_name = RSTRING_PTR(value);
-  charset_name_len = RSTRING_LEN(value);
 
 #ifdef HAVE_RUBY_ENCODING_H
+  charset_name_len = RSTRING_LEN(value);
   mysql2rb = mysql2_mysql_enc_name_to_rb(charset_name, charset_name_len);
   if (mysql2rb == NULL || mysql2rb->rb_name == NULL) {
     VALUE inspect = rb_inspect(value);
@@ -1044,22 +1182,36 @@ static VALUE set_charset_name(VALUE self, VALUE value) {
 static VALUE set_ssl_options(VALUE self, VALUE key, VALUE cert, VALUE ca, VALUE capath, VALUE cipher) {
   GET_CLIENT(self);
 
-  if(!NIL_P(ca) || !NIL_P(key)) {
-    mysql_ssl_set(wrapper->client,
-        NIL_P(key) ? NULL : StringValuePtr(key),
-        NIL_P(cert) ? NULL : StringValuePtr(cert),
-        NIL_P(ca) ? NULL : StringValuePtr(ca),
-        NIL_P(capath) ? NULL : StringValuePtr(capath),
-        NIL_P(cipher) ? NULL : StringValuePtr(cipher));
-  }
+  mysql_ssl_set(wrapper->client,
+      NIL_P(key) ? NULL : StringValuePtr(key),
+      NIL_P(cert) ? NULL : StringValuePtr(cert),
+      NIL_P(ca) ? NULL : StringValuePtr(ca),
+      NIL_P(capath) ? NULL : StringValuePtr(capath),
+      NIL_P(cipher) ? NULL : StringValuePtr(cipher));
 
   return self;
+}
+
+static VALUE set_secure_auth(VALUE self, VALUE value) {
+  return _mysql_client_options(self, MYSQL_SECURE_AUTH, value);
+}
+
+static VALUE set_read_default_file(VALUE self, VALUE value) {
+  return _mysql_client_options(self, MYSQL_READ_DEFAULT_FILE, value);
+}
+
+static VALUE set_read_default_group(VALUE self, VALUE value) {
+  return _mysql_client_options(self, MYSQL_READ_DEFAULT_GROUP, value);
+}
+
+static VALUE set_init_command(VALUE self, VALUE value) {
+  return _mysql_client_options(self, MYSQL_INIT_COMMAND, value);
 }
 
 static VALUE initialize_ext(VALUE self) {
   GET_CLIENT(self);
 
-  if (rb_thread_blocking_region(nogvl_init, wrapper->client, RUBY_UBF_IO, 0) == Qfalse) {
+  if ((VALUE)rb_thread_call_without_gvl(nogvl_init, wrapper, RUBY_UBF_IO, 0) == Qfalse) {
     /* TODO: warning - not enough memory? */
     return rb_raise_mysql2_error(wrapper);
   }
@@ -1074,16 +1226,24 @@ void init_mysql2_client() {
   int i;
   int dots = 0;
   const char *lib = mysql_get_client_info();
-  for (i = 0; lib[i] != 0 && MYSQL_SERVER_VERSION[i] != 0; i++) {
+
+  for (i = 0; lib[i] != 0 && MYSQL_LINK_VERSION[i] != 0; i++) {
     if (lib[i] == '.') {
       dots++;
               /* we only compare MAJOR and MINOR */
       if (dots == 2) break;
     }
-    if (lib[i] != MYSQL_SERVER_VERSION[i]) {
-      rb_raise(rb_eRuntimeError, "Incorrect MySQL client library version! This gem was compiled for %s but the client library is %s.", MYSQL_SERVER_VERSION, lib);
+    if (lib[i] != MYSQL_LINK_VERSION[i]) {
+      rb_raise(rb_eRuntimeError, "Incorrect MySQL client library version! This gem was compiled for %s but the client library is %s.", MYSQL_LINK_VERSION, lib);
       return;
     }
+  }
+
+  /* Initializing mysql library, so different threads could call Client.new */
+  /* without race condition in the library */
+  if (mysql_library_init(0, NULL, NULL) != 0) {
+    rb_raise(rb_eRuntimeError, "Could not initialize MySQL client library");
+    return;
   }
 
 #if 0
@@ -1112,6 +1272,8 @@ void init_mysql2_client() {
   rb_define_method(cMysql2Client, "next_result", rb_mysql_client_next_result, 0);
   rb_define_method(cMysql2Client, "store_result", rb_mysql_client_store_result, 0);
   rb_define_method(cMysql2Client, "reconnect=", set_reconnect, 1);
+  rb_define_method(cMysql2Client, "warning_count", rb_mysql_client_warning_count, 0);
+  rb_define_method(cMysql2Client, "query_info_string", rb_mysql_info, 0);
 #ifdef HAVE_RUBY_ENCODING_H
   rb_define_method(cMysql2Client, "encoding", rb_mysql_client_encoding, 0);
 #endif
@@ -1121,6 +1283,10 @@ void init_mysql2_client() {
   rb_define_private_method(cMysql2Client, "write_timeout=", set_write_timeout, 1);
   rb_define_private_method(cMysql2Client, "local_infile=", set_local_infile, 1);
   rb_define_private_method(cMysql2Client, "charset_name=", set_charset_name, 1);
+  rb_define_private_method(cMysql2Client, "secure_auth=", set_secure_auth, 1);
+  rb_define_private_method(cMysql2Client, "default_file=", set_read_default_file, 1);
+  rb_define_private_method(cMysql2Client, "default_group=", set_read_default_group, 1);
+  rb_define_private_method(cMysql2Client, "init_command=", set_init_command, 1);
   rb_define_private_method(cMysql2Client, "ssl_set", set_ssl_options, 5);
   rb_define_private_method(cMysql2Client, "initialize_ext", initialize_ext, 0);
   rb_define_private_method(cMysql2Client, "connect", rb_connect, 7);
@@ -1134,6 +1300,7 @@ void init_mysql2_client() {
   sym_stream          = ID2SYM(rb_intern("stream"));
 
   intern_merge = rb_intern("merge");
+  intern_merge_bang = rb_intern("merge!");
   intern_error_number_eql = rb_intern("error_number=");
   intern_sql_state_eql = rb_intern("sql_state=");
 
@@ -1211,6 +1378,10 @@ void init_mysql2_client() {
 #ifdef CLIENT_SECURE_CONNECTION
   rb_const_set(cMysql2Client, rb_intern("SECURE_CONNECTION"),
       LONG2NUM(CLIENT_SECURE_CONNECTION));
+#else
+  /* HACK because MySQL5.7 no longer defines this constant,
+   * but we're using it in our default connection flags. */
+  rb_const_set(cMysql2Client, rb_intern("SECURE_CONNECTION"), LONG2NUM(0));
 #endif
 
 #ifdef CLIENT_MULTI_STATEMENTS
