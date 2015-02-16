@@ -8,6 +8,7 @@ module Mysql2
       :symbolize_keys => false,       # return field names as symbols instead of strings
       :database_timezone => :local,   # timezone Mysql2 will assume datetime objects are stored in
       :application_timezone => nil,   # timezone Mysql2 will convert to before handing the object back to the caller
+      :cast_datetimes => false,       # cast date fields as Time objects in ruby
       :cache_rows => true,            # tells Mysql2 to use it's internal row cache for results
       :connect_flags => REMEMBER_OPTIONS | LONG_PASSWORD | LONG_FLAG | TRANSACTIONS | PROTOCOL_41 | SECURE_CONNECTION,
       :cast => true,

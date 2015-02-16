@@ -37,11 +37,11 @@ describe Mysql2::Client do
     it "should not raise an exception on create for a valid encoding" do
       lambda {
         Mysql2::Client.new(DatabaseCredentials['root'].merge(:encoding => "utf8"))
-      }.should_not raise_error(Mysql2::Error)
+      }.should_not raise_error
 
       lambda {
         Mysql2::Client.new(DatabaseCredentials['root'].merge(:encoding => "big5"))
-      }.should_not raise_error(Mysql2::Error)
+      }.should_not raise_error
     end
   end
 

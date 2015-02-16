@@ -65,6 +65,7 @@ static ID intern_merge;
 #define AS_STRUCT 2
 
 /* wrapper for intern.h:rb_struct_define() */
+#define STRUCT_MAX_COLUMNS  100
 static VALUE rb_mysql_struct_define2(const char *name, char **ary, int len);
 
 
@@ -243,7 +244,7 @@ static VALUE rb_mysql_result_fetch_row(VALUE self, ID db_timezone, ID app_timezo
       VALUE val = Qnil;
       enum enum_field_types type = fields[i].type;
 
-      if(!cast) {
+      if (!cast) {
         if (type == MYSQL_TYPE_NULL) {
           val = Qnil;
         } else {
@@ -253,14 +254,14 @@ static VALUE rb_mysql_result_fetch_row(VALUE self, ID db_timezone, ID app_timezo
 #endif
         }
       } else {
-        switch(type) {
+        switch (type) {
         case MYSQL_TYPE_NULL:       /* NULL-type field */
           val = Qnil;
           break;
         case MYSQL_TYPE_BIT:        /* BIT field (MySQL 5.0.3 and up) */
           if (castBool && fields[i].length == 1) {
             val = *row[i] == 1 ? Qtrue : Qfalse;
-          }else{
+          } else {
             val = rb_str_new(row[i], fieldLengths[i]);
           }
           break;
@@ -280,9 +281,9 @@ static VALUE rb_mysql_result_fetch_row(VALUE self, ID db_timezone, ID app_timezo
         case MYSQL_TYPE_NEWDECIMAL: /* Precision math DECIMAL or NUMERIC field (MySQL 5.0.3 and up) */
           if (fields[i].decimals == 0) {
             val = rb_cstr2inum(row[i], 10);
-          } else if (strtod(row[i], NULL) == 0.000000){
+          } else if (strtod(row[i], NULL) == 0.000000) {
             val = rb_funcall(cBigDecimal, intern_new, 1, opt_decimal_zero);
-          }else{
+          } else {
             val = rb_funcall(cBigDecimal, intern_new, 1, rb_str_new(row[i], fieldLengths[i]));
           }
           break;
@@ -290,9 +291,9 @@ static VALUE rb_mysql_result_fetch_row(VALUE self, ID db_timezone, ID app_timezo
         case MYSQL_TYPE_DOUBLE: {     /* DOUBLE or REAL field */
           double column_to_double;
           column_to_double = strtod(row[i], NULL);
-          if (column_to_double == 0.000000){
+          if (column_to_double == 0.000000) {
             val = opt_float_zero;
-          }else{
+          } else {
             val = rb_float_new(column_to_double);
           }
           break;
@@ -435,9 +436,9 @@ static VALUE rb_mysql_result_fetch_row(VALUE self, ID db_timezone, ID app_timezo
 
   if (as == AS_STRUCT) {
     if (wrapper->asStruct == Qnil) {
-      char *buf[100];
+      char *buf[STRUCT_MAX_COLUMNS];
 
-      if (wrapper->numberOfFields > 100)
+      if (wrapper->numberOfFields > STRUCT_MAX_COLUMNS)
         rb_raise(cMysql2Error, "Too many struct fields: %d", wrapper->numberOfFields);
 
       for (i = 0; i < wrapper->numberOfFields; i++) {
@@ -527,11 +528,11 @@ static VALUE rb_mysql_result_each(int argc, VALUE * argv, VALUE self) {
     cast = 0;
   }
 
-  if(rb_hash_aref(opts, sym_stream) == Qtrue) {
+  if (rb_hash_aref(opts, sym_stream) == Qtrue) {
     streaming = 1;
   }
 
-  if(streaming && cacheRows) {
+  if (streaming && cacheRows) {
     rb_warn("cacheRows is ignored if streaming is true");
   }
 
@@ -649,8 +650,8 @@ static VALUE rb_mysql_result_count(VALUE self) {
   mysql2_result_wrapper *wrapper;
 
   GetMysql2Result(self, wrapper);
-  if(wrapper->resultFreed) {
-    if (wrapper->streamingComplete){
+  if (wrapper->resultFreed) {
+    if (wrapper->streamingComplete) {
       return LONG2NUM(wrapper->numberOfRows);
     } else {
       return LONG2NUM(RARRAY_LEN(wrapper->rows));
@@ -737,7 +738,7 @@ void init_mysql2_result() {
 /*
 # Ruby snippet to create the switch statement below.
 def xxx
-    return (1..100).collect do |i|
+    return (1..STRUCT_MAX_COLUMNS).collect do |i|
         "  case #{i}:\n    st = rb_struct_define(name, " + 
         i.times.collect {|a| "ary[#{a}], "}.join +
         "NULL);\n    break;\n"
@@ -1054,6 +1055,8 @@ static VALUE rb_mysql_struct_define2(const char *name, char **ary, int len) {
   case 100:
     st = rb_struct_define(name, ary[0], ary[1], ary[2], ary[3], ary[4], ary[5], ary[6], ary[7], ary[8], ary[9], ary[10], ary[11], ary[12], ary[13], ary[14], ary[15], ary[16], ary[17], ary[18], ary[19], ary[20], ary[21], ary[22], ary[23], ary[24], ary[25], ary[26], ary[27], ary[28], ary[29], ary[30], ary[31], ary[32], ary[33], ary[34], ary[35], ary[36], ary[37], ary[38], ary[39], ary[40], ary[41], ary[42], ary[43], ary[44], ary[45], ary[46], ary[47], ary[48], ary[49], ary[50], ary[51], ary[52], ary[53], ary[54], ary[55], ary[56], ary[57], ary[58], ary[59], ary[60], ary[61], ary[62], ary[63], ary[64], ary[65], ary[66], ary[67], ary[68], ary[69], ary[70], ary[71], ary[72], ary[73], ary[74], ary[75], ary[76], ary[77], ary[78], ary[79], ary[80], ary[81], ary[82], ary[83], ary[84], ary[85], ary[86], ary[87], ary[88], ary[89], ary[90], ary[91], ary[92], ary[93], ary[94], ary[95], ary[96], ary[97], ary[98], ary[99], NULL);
     break;
+  default:
+    st = Qnil;
   }
 
   return st;
